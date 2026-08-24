@@ -69,38 +69,60 @@ from peft import PeftModel
 import gc
 
 
-def generate_with_adapter(adapter_path: Path, prompts: list[dict], max_new_tokens: int = 256):
+def _ensure_tok(tok):
+    if getattr(tok, "chat_template", None):
+        return tok
+    try:
+        from unsloth.chat_templates import get_chat_template
+        return get_chat_template(tok, chat_template="qwen-2.5")
+    except Exception:
+        return tok
+
+
+def generate_with_adapter(adapter_path: Path, prompts: list[dict], max_new_tokens: int = 128):
     """Load base + adapter, generate for all prompts, free memory, return outputs."""
+    seq_len = min(int(MAX_LEN), 512)
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=BASE_MODEL,
-        max_seq_length=MAX_LEN,
+        max_seq_length=seq_len,
         dtype=None,
         load_in_4bit=True,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = _ensure_tok(tokenizer)
 
     model = PeftModel.from_pretrained(model, str(adapter_path))
     FastLanguageModel.for_inference(model)
+    if hasattr(model, "config"):
+        model.config.use_cache = True
+    device = next(model.parameters()).device
 
     outputs = []
     for p in prompts:
         messages = [{"role": "user", "content": p["prompt"]}]
-        inputs = tokenizer.apply_chat_template(
-            messages, return_tensors="pt", add_generation_prompt=True
-        ).to("cuda")
+        enc = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+        )
+        if hasattr(enc, "to"):
+            input_ids = enc.to(device)
+            attn = None
+        else:
+            enc = {k: v.to(device) for k, v in enc.items()}
+            input_ids = enc["input_ids"]
+            attn = enc.get("attention_mask")
+        prompt_len = input_ids.shape[-1]
         with torch.no_grad():
             out = model.generate(
-                input_ids=inputs,
+                input_ids=input_ids,
+                attention_mask=attn,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,             # deterministic for fair comparison
-                temperature=1.0,
+                do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
-        generated = tokenizer.decode(out[0][inputs.shape[1]:], skip_special_tokens=True)
+        generated = tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True)
         outputs.append(generated.strip())
 
-    # Free memory before loading next adapter
     del model, tokenizer
     gc.collect()
     torch.cuda.empty_cache()
