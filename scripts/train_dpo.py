@@ -94,6 +94,73 @@ def main():
         model=model, ref_model=None, args=config,
         train_dataset=pref, processing_class=tokenizer,
     )
+
+    # T4 (sm_75): xformers has no BMGHK GQA backward. Flatten 5D→4D / SDPA.
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 0):
+        import importlib
+        import torch.nn.functional as F
+
+        def _sdpa_backend(use_varlen=False):
+            return "sdpa"
+
+        for name in (
+            "unsloth.utils.attention_dispatch",
+            "unsloth.models._utils",
+            "unsloth.models.llama",
+            "unsloth.models.qwen2",
+        ):
+            try:
+                mod = importlib.import_module(name)
+            except Exception:
+                continue
+            if hasattr(mod, "HAS_XFORMERS"):
+                mod.HAS_XFORMERS = False
+            if hasattr(mod, "select_attention_backend"):
+                mod.select_attention_backend = _sdpa_backend
+
+        def _wrap(orig):
+            if orig is None or getattr(orig, "_lab22_t4", False):
+                return orig
+
+            def wrapped(query, key, value, attn_bias=None, p=0.0, *args, **kwargs):
+                q, k, v, restore = query, key, value, None
+                if getattr(q, "dim", lambda: 0)() == 5:
+                    B, M, G, H, D = q.shape
+                    q = q.reshape(B, M, G * H, D)
+                    k = k.reshape(B, k.shape[1], -1, D)
+                    v = v.reshape(B, v.shape[1], -1, D)
+                    restore = (B, M, G, H, D)
+                try:
+                    out = orig(q, k, v, attn_bias=attn_bias, p=p, *args, **kwargs)
+                except NotImplementedError:
+                    qt, kt, vt = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                    drop = float(p or 0.0) if torch.is_grad_enabled() else 0.0
+                    is_causal = attn_bias is not None and not isinstance(attn_bias, torch.Tensor)
+                    mask = attn_bias if isinstance(attn_bias, torch.Tensor) else None
+                    out = F.scaled_dot_product_attention(
+                        qt, kt, vt, attn_mask=mask, dropout_p=drop, is_causal=bool(is_causal)
+                    ).transpose(1, 2).contiguous()
+                return out.reshape(restore) if restore is not None else out
+
+            wrapped._lab22_t4 = True
+            return wrapped
+
+        for name, attr in (
+            ("xformers.ops", "memory_efficient_attention"),
+            ("xformers.ops.fmha", "memory_efficient_attention"),
+            ("unsloth.models._utils", "xformers_attention"),
+            ("unsloth.models.llama", "xformers_attention"),
+            ("unsloth.utils.attention_dispatch", "xformers_attention"),
+        ):
+            try:
+                mod = importlib.import_module(name)
+                fn = getattr(mod, attr, None)
+                if callable(fn):
+                    setattr(mod, attr, _wrap(fn))
+            except Exception:
+                pass
+        print("T4 attention patch: xformers GQA disabled → SDPA / 4D flatten")
+
     train_result = trainer.train()
 
     trainer.model.save_pretrained(str(output))
