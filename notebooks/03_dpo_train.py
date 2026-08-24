@@ -254,6 +254,20 @@ def patch_t4_attention():
 patch_t4_attention()
 if hasattr(model, "config"):
     model.config.use_cache = False
+
+def patch_hf_gradient_checkpointing(model):
+    """transformers 5.x Qwen2DecoderLayer lacks _gradient_checkpointing_func."""
+    import functools
+    import torch.utils.checkpoint as tuc
+    fn = functools.partial(tuc.checkpoint, use_reentrant=False)
+    n = 0
+    for m in model.modules():
+        if "DecoderLayer" in type(m).__name__:
+            m._gradient_checkpointing_func = fn
+            n += 1
+    print(f"Patched _gradient_checkpointing_func on {n} decoder layers")
+
+patch_hf_gradient_checkpointing(model)
 train_result = trainer.train()
 print(f"\nFinal DPO loss: {train_result.training_loss:.4f}")
 

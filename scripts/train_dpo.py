@@ -171,6 +171,13 @@ def main():
         if hasattr(model, "config"):
             model.config.use_cache = False
 
+    import functools
+    import torch.utils.checkpoint as tuc
+    _gc = functools.partial(tuc.checkpoint, use_reentrant=False)
+    for m in model.modules():
+        if "DecoderLayer" in type(m).__name__:
+            m._gradient_checkpointing_func = _gc
+
     train_result = trainer.train()
 
     trainer.model.save_pretrained(str(output))
