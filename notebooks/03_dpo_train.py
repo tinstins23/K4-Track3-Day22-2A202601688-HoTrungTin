@@ -27,10 +27,10 @@ COMPUTE_TIER = os.environ.get("COMPUTE_TIER", "T4").upper()
 
 if COMPUTE_TIER == "T4":
     BASE_MODEL = "unsloth/Qwen2.5-3B-bnb-4bit"
-    MAX_LEN = 384
-    MAX_PROMPT_LEN = 192
+    MAX_LEN = 256
+    MAX_PROMPT_LEN = 128
     PER_DEVICE_BATCH = 1
-    GRAD_ACCUM = 8
+    GRAD_ACCUM = 16
 else:
     BASE_MODEL = "unsloth/Qwen2.5-7B-bnb-4bit"
     MAX_LEN = 1024

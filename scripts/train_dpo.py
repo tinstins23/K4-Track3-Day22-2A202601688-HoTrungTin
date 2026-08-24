@@ -32,8 +32,8 @@ def main():
     tier = os.environ.get("COMPUTE_TIER", "T4").upper()
     if tier == "T4":
         base_model = "unsloth/Qwen2.5-3B-bnb-4bit"
-        max_len, max_prompt = 384, 192
-        batch, grad_accum = 1, 8
+        max_len, max_prompt = 256, 128
+        batch, grad_accum = 1, 16
     else:
         base_model = "unsloth/Qwen2.5-7B-bnb-4bit"
         max_len, max_prompt = 1024, 512
