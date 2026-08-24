@@ -255,38 +255,15 @@ patch_t4_attention()
 if hasattr(model, "config"):
     model.config.use_cache = False
 
-def patch_hf_gc_class():
-    """Unsloth for_training() creates new layers AFTER instance patches. Fix the class."""
-    import functools
-    import torch.utils.checkpoint as tuc
-    import transformers.modeling_layers as ml
-    fn = functools.partial(tuc.checkpoint, use_reentrant=False)
-    ml.GradientCheckpointingLayer._gradient_checkpointing_func = fn
-    try:
-        from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
-        Qwen2DecoderLayer._gradient_checkpointing_func = fn
-    except Exception:
-        pass
-    orig = ml.GradientCheckpointingLayer.__call__
-    if getattr(orig, "_lab22_gc", False):
-        return
-    def _call(self, *args, **kwargs):
-        if "_gradient_checkpointing_func" not in getattr(self, "__dict__", {}):
-            object.__setattr__(self, "_gradient_checkpointing_func", fn)
-        return orig(self, *args, **kwargs)
-    _call._lab22_gc = True
-    ml.GradientCheckpointingLayer.__call__ = _call
-    print("Patched GradientCheckpointingLayer class (transformers 5.x)")
-
-patch_hf_gc_class()
-if hasattr(model, "for_training") and not getattr(model.for_training, "_lab22_gc", False):
-    _ft = model.for_training
-    def _ft_wrapped(*a, **k):
-        out = _ft(*a, **k)
-        patch_hf_gc_class()
-        return out
-    _ft_wrapped._lab22_gc = True
-    model.for_training = _ft_wrapped
+# Bypass HF GC __call__: Unsloth for_training() builds new layers without _gradient_checkpointing_func.
+import torch.nn as nn
+import transformers.modeling_layers as _ml
+if not getattr(_ml.GradientCheckpointingLayer.__call__, "_lab22_bypass", False):
+    def _bypass_gc_call(self, *args, **kwargs):
+        return nn.Module.__call__(self, *args, **kwargs)
+    _bypass_gc_call._lab22_bypass = True
+    _ml.GradientCheckpointingLayer.__call__ = _bypass_gc_call
+    print("Bypassed HF GradientCheckpointingLayer (Unsloth GC still on)")
 
 train_result = trainer.train()
 print(f"\nFinal DPO loss: {train_result.training_loss:.4f}")

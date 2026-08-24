@@ -171,19 +171,14 @@ def main():
         if hasattr(model, "config"):
             model.config.use_cache = False
 
-    import functools
-    import torch.utils.checkpoint as tuc
+    import torch.nn as nn
     import transformers.modeling_layers as ml
-    _gc = functools.partial(tuc.checkpoint, use_reentrant=False)
-    ml.GradientCheckpointingLayer._gradient_checkpointing_func = _gc
-    orig_call = ml.GradientCheckpointingLayer.__call__
-    if not getattr(orig_call, "_lab22_gc", False):
-        def _call(self, *args, **kwargs):
-            if "_gradient_checkpointing_func" not in getattr(self, "__dict__", {}):
-                object.__setattr__(self, "_gradient_checkpointing_func", _gc)
-            return orig_call(self, *args, **kwargs)
-        _call._lab22_gc = True
-        ml.GradientCheckpointingLayer.__call__ = _call
+    if not getattr(ml.GradientCheckpointingLayer.__call__, "_lab22_bypass", False):
+        def _bypass_gc_call(self, *args, **kwargs):
+            return nn.Module.__call__(self, *args, **kwargs)
+        _bypass_gc_call._lab22_bypass = True
+        ml.GradientCheckpointingLayer.__call__ = _bypass_gc_call
+        print("Bypassed HF GradientCheckpointingLayer (Unsloth GC still on)")
 
     train_result = trainer.train()
 
