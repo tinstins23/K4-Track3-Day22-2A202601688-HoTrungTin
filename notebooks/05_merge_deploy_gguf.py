@@ -110,19 +110,40 @@ torch.cuda.empty_cache()
 # llama.cpp (~3 min) then quantizes (~30 s).
 
 # %%
-# Reload the merged model — Unsloth's GGUF saver expects a live model handle.
+# Live 16bit handle for GGUF. Disk merged-fp16 is still 4bit+LoRA despite "success".
+import gc
+import torch
 from unsloth import FastLanguageModel as FLM
+from peft import PeftModel
 
+if "model" in globals():
+    del model
+gc.collect()
+torch.cuda.empty_cache()
+
+fp16_base = BASE_MODEL.replace("-bnb-4bit", "")
 model, tokenizer = FLM.from_pretrained(
-    model_name=str(MERGED_PATH),
+    model_name=fp16_base,
     max_seq_length=MAX_LEN,
-    dtype=None,
-    load_in_4bit=False,    # already merged; load full precision
+    dtype=torch.float16,
+    load_in_4bit=False,
+    load_in_8bit=False,
 )
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+model = PeftModel.from_pretrained(model, str(SFT_PATH))
+model = model.merge_and_unload()
+model = PeftModel.from_pretrained(model, str(DPO_PATH))
+model = model.merge_and_unload()
 
 # %%
-# Save GGUF in 1 quantization tier (Q4_K_M). Add more tiers below if you want the
-# +3 "GGUF release published" rigor add-on.
+# Save GGUF in 1 quantization tier (Q4_K_M).
+import shutil
+
+shutil.rmtree(GGUF_DIR, ignore_errors=True)
+GGUF_DIR.mkdir(parents=True, exist_ok=True)
+
 model.save_pretrained_gguf(
     str(GGUF_DIR),
     tokenizer,
