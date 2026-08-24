@@ -87,7 +87,7 @@ def main():
         seed=42,
         loss_type="sigmoid",
         report_to="none",
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,
         precompute_ref_log_probs=True,
     )
 
@@ -173,10 +173,17 @@ def main():
 
     import functools
     import torch.utils.checkpoint as tuc
+    import transformers.modeling_layers as ml
     _gc = functools.partial(tuc.checkpoint, use_reentrant=False)
-    for m in model.modules():
-        if "DecoderLayer" in type(m).__name__:
-            m._gradient_checkpointing_func = _gc
+    ml.GradientCheckpointingLayer._gradient_checkpointing_func = _gc
+    orig_call = ml.GradientCheckpointingLayer.__call__
+    if not getattr(orig_call, "_lab22_gc", False):
+        def _call(self, *args, **kwargs):
+            if "_gradient_checkpointing_func" not in getattr(self, "__dict__", {}):
+                object.__setattr__(self, "_gradient_checkpointing_func", _gc)
+            return orig_call(self, *args, **kwargs)
+        _call._lab22_gc = True
+        ml.GradientCheckpointingLayer.__call__ = _call
 
     train_result = trainer.train()
 
