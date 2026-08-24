@@ -84,6 +84,25 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
     print("Set tokenizer.pad_token = eos_token")
+if getattr(tokenizer, "chat_template", None) is None:
+    tokenizer.chat_template = (
+        "{% for message in messages %}"
+        "{% if loop.first and message['role'] != 'system' %}"
+        "{{ '<|im_start|>system\\nYou are a helpful assistant.<|im_end|>\\n' }}"
+        "{% endif %}"
+        "{% if message['role'] == 'user' %}"
+        "{{ '<|im_start|>user\\n' + message['content'] + '<|im_end|>\\n' }}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ '<|im_start|>assistant\\n' + message['content'] + '<|im_end|>\\n' }}"
+        "{% elif message['role'] == 'system' %}"
+        "{{ '<|im_start|>system\\n' + message['content'] + '<|im_end|>\\n' }}"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "{{ '<|im_start|>assistant\\n' }}"
+        "{% endif %}"
+    )
+    print("Set fallback Qwen ChatML chat_template")
 
 # %%
 model = FastLanguageModel.get_peft_model(
@@ -101,6 +120,9 @@ model = FastLanguageModel.get_peft_model(
     use_rslora=False,
     loftq_config=None,
 )
+model._hf_peft_config_loaded = True
+if getattr(model, "config", None) is not None:
+    model.config._hf_peft_config_loaded = True
 print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
 # %% [markdown]
@@ -117,16 +139,26 @@ print(f"Loaded {len(ds)} rows. Columns: {ds.column_names}")
 print(f"\nFirst row:\n{ds[0]}")
 
 # %%
-# Alpaca → ChatML format (Qwen2.5's native template)
+# Alpaca → ChatML. Dataset uses instruction_vi/input_vi/output_vi (not classic Alpaca names).
+def _first(*vals):
+    for v in vals:
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
 def format_alpaca_to_chat(row):
+    instruction = _first(row.get("instruction_vi"), row.get("instruction"), row.get("instruction_en"))
+    extra = _first(row.get("input_vi"), row.get("input"), row.get("input_en"))
+    output = _first(row.get("output_vi"), row.get("output"), row.get("output_en"))
     messages = []
-    if row.get("instruction"):
-        prompt = row["instruction"]
-        if row.get("input"):
-            prompt += "\n\n" + row["input"]
+    if instruction:
+        prompt = f"{instruction}\n\n{extra}" if extra else instruction
         messages.append({"role": "user", "content": prompt})
-    if row.get("output"):
-        messages.append({"role": "assistant", "content": row["output"]})
+    if output:
+        messages.append({"role": "assistant", "content": output})
+    if not messages:
+        return {"text": ""}
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     return {"text": text}
 
@@ -156,6 +188,7 @@ sft_config = SFTConfig(
     seed=42,
     max_length=MAX_LEN,
     dataset_text_field="text",
+    packing=False,
     report_to="none",
 )
 
