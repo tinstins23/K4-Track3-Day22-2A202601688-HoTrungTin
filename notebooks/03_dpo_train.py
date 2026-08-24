@@ -27,8 +27,8 @@ COMPUTE_TIER = os.environ.get("COMPUTE_TIER", "T4").upper()
 
 if COMPUTE_TIER == "T4":
     BASE_MODEL = "unsloth/Qwen2.5-3B-bnb-4bit"
-    MAX_LEN = 512
-    MAX_PROMPT_LEN = 256
+    MAX_LEN = 384
+    MAX_PROMPT_LEN = 192
     PER_DEVICE_BATCH = 1
     GRAD_ACCUM = 8
 else:
@@ -144,6 +144,8 @@ dpo_config = DPOConfig(
     seed=42,
     loss_type="sigmoid",         # DPO standard (alternatives: ipo, hinge, kto)
     report_to="none",
+    gradient_checkpointing=True,
+    precompute_ref_log_probs=True,  # T4: one ref pass, then train without dual forward
 )
 
 print(f"DPOConfig: beta={dpo_config.beta}  lr={dpo_config.learning_rate}  loss_type={dpo_config.loss_type}")
@@ -174,15 +176,26 @@ trainer = DPOTrainer(
 
 # %%
 def patch_t4_attention():
-    """T4 (sm_75) cannot run xformers GQA backward (BMGHK 5D). Force SDPA + flatten 5D→4D."""
+    """T4: keep xformers (SDPA OOMs on 14GB). Flatten GQA 5D BMGHK → 4D for cutlass backward."""
     import importlib
-    import torch.nn.functional as F
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() >= (8, 0):
         return
 
-    def _sdpa_backend(use_varlen=False):
-        return "sdpa"
+    try:
+        import xformers  # noqa: F401
+        has_xf = True
+    except Exception:
+        has_xf = False
+
+    def _backend(use_varlen=False):
+        try:
+            from unsloth.models._utils import HAS_FLASH_ATTENTION as _fa
+        except Exception:
+            _fa = False
+        if _fa:
+            return "flash_varlen" if use_varlen else "flash_dense"
+        return "xformers" if has_xf else "sdpa"
 
     for name in (
         "unsloth.utils.attention_dispatch",
@@ -195,13 +208,16 @@ def patch_t4_attention():
         except Exception:
             continue
         if hasattr(mod, "HAS_XFORMERS"):
-            mod.HAS_XFORMERS = False
+            mod.HAS_XFORMERS = has_xf
         if hasattr(mod, "select_attention_backend"):
-            mod.select_attention_backend = _sdpa_backend
+            mod.select_attention_backend = _backend
 
     def _wrap(orig):
-        if orig is None or getattr(orig, "_lab22_t4", False):
-            return orig
+        inner = orig
+        while getattr(inner, "_lab22_orig", None) is not None:
+            inner = inner._lab22_orig
+        if getattr(inner, "_lab22_t4", False):
+            return inner
 
         def wrapped(query, key, value, attn_bias=None, p=0.0, *args, **kwargs):
             q, k, v, restore = query, key, value, None
@@ -211,19 +227,11 @@ def patch_t4_attention():
                 k = k.reshape(B, k.shape[1], -1, D)
                 v = v.reshape(B, v.shape[1], -1, D)
                 restore = (B, M, G, H, D)
-            try:
-                out = orig(q, k, v, attn_bias=attn_bias, p=p, *args, **kwargs)
-            except NotImplementedError:
-                qt, kt, vt = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-                drop = float(p or 0.0) if torch.is_grad_enabled() else 0.0
-                is_causal = attn_bias is not None and not isinstance(attn_bias, torch.Tensor)
-                mask = attn_bias if isinstance(attn_bias, torch.Tensor) else None
-                out = F.scaled_dot_product_attention(
-                    qt, kt, vt, attn_mask=mask, dropout_p=drop, is_causal=bool(is_causal)
-                ).transpose(1, 2).contiguous()
+            out = inner(q, k, v, attn_bias=attn_bias, p=p, *args, **kwargs)
             return out.reshape(restore) if restore is not None else out
 
         wrapped._lab22_t4 = True
+        wrapped._lab22_orig = inner
         return wrapped
 
     for name, attr in (
@@ -240,10 +248,12 @@ def patch_t4_attention():
                 setattr(mod, attr, _wrap(fn))
         except Exception:
             pass
-    print("T4 attention patch: xformers GQA disabled → SDPA / 4D flatten")
+    print("T4 attention patch: xformers GQA 5D→4D (kept memory-efficient kernels)")
 
 
 patch_t4_attention()
+if hasattr(model, "config"):
+    model.config.use_cache = False
 train_result = trainer.train()
 print(f"\nFinal DPO loss: {train_result.training_loss:.4f}")
 
